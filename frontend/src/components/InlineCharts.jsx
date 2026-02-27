@@ -13,6 +13,7 @@ import PeerBarChart from './charts/PeerBarChart';
 import GapToLeaderChart from './charts/GapToLeaderChart';
 import EnvSocialScatter from './charts/EnvSocialScatter';
 import PillarStackedChart from './charts/PillarStackedChart';
+import RecommendationsPanel from './charts/RecommendationsPanel';
 
 const HEATMAP_LEGEND = [
   ['#1a4731', '80–100'], ['#1c3a4a', '60–79'], ['#3a2c14', '40–59'],
@@ -178,6 +179,18 @@ export default function InlineCharts({ charts }) {
             return (
               <ChartCard key={i} title={chart.title || 'Pillar Breakdown — Top 8 Companies'}>
                 <PillarStackedChart data={chart.data} selectedName={chart.selectedName} />
+              </ChartCard>
+            );
+
+          case 'recommendations':
+            return (
+              <ChartCard key={i} title={chart.title || 'AI Recommendations'} defaultOpen={true}>
+                <RecommendationsPanel
+                  recommendations={chart.data}
+                  currentScores={chart.currentScores}
+                  percentiles={chart.percentiles}
+                  sectorStats={chart.sectorStats}
+                />
               </ChartCard>
             );
 

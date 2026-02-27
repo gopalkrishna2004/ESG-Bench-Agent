@@ -234,6 +234,17 @@ const FUNCTION_DECLARATIONS = [
     parameters: { type: 'object', properties: {} },
   },
   {
+    name: 'get_recommendations',
+    description: 'Generate 5 prioritized AI recommendations for improving ESG scores with impact estimates and effort levels. Use when user asks for recommendations, improvement plan, action items, or what to focus on.',
+    parameters: {
+      type: 'object',
+      properties: {
+        company_id: { type: 'string', description: 'MongoDB _id of the company' },
+      },
+      required: ['company_id'],
+    },
+  },
+  {
     name: 'suggest_charts',
     description: `After fetching data, call this to specify ONLY the charts that directly answer the user's question. Pick 1-2 charts maximum — never repeat similar charts.
 
@@ -255,6 +266,7 @@ Available chart keys and when to use them:
 - "gap_leader"     → Gap to sector leader bars   → "gap to leader", "how far behind the best", "distance from top"
 - "env_scatter"    → Environmental vs Social scatter → "env vs social", "quadrant", "scatter", "positioning"
 - "pillar_stacked" → Top-8 stacked pillar chart  → "pillar breakdown", "stacked comparison", "top companies breakdown"
+- "recommendations" → AI recommendation cards + improvement simulator → "recommendations", "what should we improve", "action plan", "how to improve ESG"
 - "report"         → Full ESG report (ALL sections) → "full report", "generate report", "full analysis", "PDF", "complete report", "all charts"
 
 STRICT RULES:
@@ -268,6 +280,7 @@ STRICT RULES:
 - For gap to sector leader → use ["gap_leader"] only
 - For env vs social positioning → use ["env_scatter"] only
 - For top-8 pillar breakdown → use ["pillar_stacked"] only
+- For recommendations / action plan / what to improve → call get_recommendations, then ["recommendations"]
 - For full report / all charts / PDF → FIRST call generate_report (no other tools needed), THEN suggest_charts(["report"])`,
     parameters: {
       type: 'object',
@@ -357,6 +370,150 @@ async function executeTool(name, args) {
     };
   }
 
+  if (name === 'get_recommendations') {
+    const data = await buildBenchmark(args.company_id);
+    const { weaknesses, opportunities, strengths, gapAnalysis, percentiles,
+            pillarScores, sectorStats, company, peerCount } = data;
+
+    // Exclude data_breaches from recommendations
+    const excludeMetrics = ['data_breaches'];
+    const filteredWeaknesses = weaknesses.filter((w) => !excludeMetrics.includes(w.metric));
+    const filteredOpportunities = opportunities.filter((o) => !excludeMetrics.includes(o.metric));
+
+    // Build rich per-metric context with company value, leader, avg, rank, peers
+    const allCompanies = await EsgCompany.find({});
+    const { enriched } = computeSectorStats(allCompanies);
+    const metricDetails = {};
+    Object.entries(METRICS_CONFIG).forEach(([metric, config]) => {
+      if (excludeMetrics.includes(metric)) return;
+      const gap = gapAnalysis[metric];
+      if (!gap) return;
+      // Build ranking for this metric
+      const vals = enriched
+        .filter((c) => c[metric] != null)
+        .map((c) => ({ name: c.company_name, value: c[metric] }))
+        .sort((a, b) => config.lowerIsBetter ? a.value - b.value : b.value - a.value);
+      const companyRank = vals.findIndex((v) => v.name === company.company_name) + 1;
+      const top3 = vals.slice(0, 3).map((v) => `${v.name} (${typeof v.value === 'number' ? v.value.toFixed(1) : v.value}${config.unit === '%' ? '%' : ''})`);
+
+      metricDetails[metric] = {
+        label: config.label,
+        pillar: config.pillar,
+        unit: config.unit,
+        lowerIsBetter: config.lowerIsBetter,
+        companyValue: gap.companyValue,
+        sectorAvg: gap.avgValue,
+        leaderValue: gap.leaderValue,
+        leaderName: gap.leaderName,
+        percentile: percentiles[metric],
+        rank: companyRank,
+        totalPeers: vals.length,
+        top3Leaders: top3,
+        sectorP25: sectorStats[metric]?.p25,
+        sectorP50: sectorStats[metric]?.p50,
+        sectorP75: sectorStats[metric]?.p75,
+      };
+    });
+
+    const context = {
+      company_name: company.company_name,
+      sector: 'Oil & Gas',
+      pillarScores,
+      peerCount,
+      weaknesses: filteredWeaknesses,
+      opportunities: filteredOpportunities,
+      strengths,
+      metricDetails,
+    };
+
+    const recModel = genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
+        maxOutputTokens: 6000,
+      },
+    });
+
+    const recPrompt = `You are an expert ESG strategy advisor specializing in the oil & gas sector. Given this company's detailed benchmark data with peer rankings, generate exactly 5 high-impact, actionable recommendations.
+
+Company: ${context.company_name}
+Sector: Oil & Gas (${context.peerCount} peers)
+Current Scores: E=${context.pillarScores.environmental}/100, S=${context.pillarScores.social}/100, G=${context.pillarScores.governance}/100, Overall=${context.pillarScores.overall}/100
+
+DETAILED METRIC DATA (with peer rankings, leader names, sector stats):
+${JSON.stringify(context.metricDetails, null, 2)}
+
+WEAKNESSES (bottom 25th %ile): ${JSON.stringify(context.weaknesses)}
+OPPORTUNITIES (25-50th %ile): ${JSON.stringify(context.opportunities)}
+STRENGTHS (top 25th %ile): ${JSON.stringify(context.strengths)}
+
+Write recommendations in this style — specific, data-rich, mentioning real peer names and exact numbers:
+
+EXAMPLE TITLE: "Close the Gender Leadership Gap — 29% → 35% Women in VP+ Roles"
+EXAMPLE DESCRIPTION: "You rank #6 of 10 peers on women in leadership. ONGC (38%) and BPCL (40%) are setting the standard. A 6pp improvement would move you to #3, ahead of GAIL and IOCL. Investors including major ESG funds have flagged this as a key engagement priority for oil & gas companies."
+
+Return a JSON array of exactly 5 objects, each with:
+- "id": number 1-5 (priority order, 1 = most impactful)
+- "title": specific action with current → target numbers using actual company data. Use the format: "Action Description — X% → Y% Metric" or "Reduce X from Y to Z"
+- "description": 2-3 rich sentences that MUST include: (a) the company's exact rank among peers, (b) names of 1-2 top-performing peers with their values, (c) what specific improvement would change the ranking, (d) reference to an ESG framework or investor concern where relevant
+- "tags": 2-3 tag objects [{label, color}]. Colors: "green" (environmental), "blue" (social), "purple" (governance), "yellow" (framework/rating impact like "S&P CSA: +5 pts"), "orange" (future-proofing)
+- "esg_impact_pts": integer 1-15 (estimated overall ESG score improvement)
+- "effort_level": "LOW" | "MED" | "HIGH"
+- "affected_metrics": [{metric_key, current_percentile, target_percentile}] — use EXACT metric_key names from the data, use actual current_percentile from data, set realistic target_percentile
+- "pillar": "environmental" | "social" | "governance"
+
+RULES:
+- Do NOT include "data_breaches" in any recommendation
+- Use REAL company names from the top3Leaders data
+- Use ACTUAL values and percentiles from the metricDetails
+- Title must contain specific numbers (current → target)
+- Description must name at least one peer competitor
+- Mix of E, S, G pillars across the 5 recommendations
+- Prioritize: (1) weaknesses with largest gap, (2) quick wins, (3) protect strengths`;
+
+    let recommendations;
+    try {
+      const recResult = await recModel.generateContent(recPrompt);
+      recommendations = JSON.parse(recResult.response.text());
+    } catch (parseErr) {
+      // Fallback: generate data-rich recommendations from weaknesses/opportunities
+      recommendations = [...filteredWeaknesses, ...filteredOpportunities].slice(0, 5).map((item, idx) => {
+        const md = metricDetails[item.metric];
+        const pillarLabel = METRICS_CONFIG[item.metric]?.pillar === 'environmental' ? 'Environmental'
+          : METRICS_CONFIG[item.metric]?.pillar === 'social' ? 'Social' : 'Governance';
+        const pillarColor = METRICS_CONFIG[item.metric]?.pillar === 'environmental' ? 'green'
+          : METRICS_CONFIG[item.metric]?.pillar === 'social' ? 'blue' : 'purple';
+        const targetVal = md ? (md.lowerIsBetter ? md.sectorP50 : md.sectorP50) : null;
+        const currentVal = md?.companyValue;
+        const titleNum = currentVal != null && targetVal != null
+          ? ` — ${currentVal.toFixed(1)} → ${targetVal.toFixed(1)} ${md.unit}`
+          : '';
+
+        return {
+          id: idx + 1,
+          title: `Improve ${item.label}${titleNum}`,
+          description: md
+            ? `You rank #${md.rank} of ${md.totalPeers} peers. ${md.leaderName} leads at ${md.leaderValue?.toFixed(1)} ${md.unit}. Moving to the sector median (${md.sectorP50?.toFixed(1)}) would boost your ${md.pillar} pillar score significantly.`
+            : `Currently at ${item.percentile}th percentile. Improving to sector median would boost your ${pillarLabel.toLowerCase()} score.`,
+          tags: [{ label: pillarLabel, color: pillarColor }],
+          esg_impact_pts: Math.max(1, Math.round((50 - item.percentile) / 5)),
+          effort_level: item.percentile <= 25 ? 'HIGH' : 'MED',
+          affected_metrics: [{ metric_key: item.metric, current_percentile: item.percentile, target_percentile: Math.min(75, item.percentile + 25) }],
+          pillar: METRICS_CONFIG[item.metric]?.pillar || 'environmental',
+        };
+      });
+    }
+
+    return {
+      recommendations,
+      company_name: company.company_name,
+      currentScores: pillarScores,
+      percentiles,
+      sectorStats,
+      summary: `Generated 5 AI recommendations for ${company.company_name}. Top priority: ${recommendations[0]?.title}`,
+    };
+  }
+
   throw new Error(`Unknown function: ${name}`);
 }
 
@@ -403,6 +560,18 @@ function buildChartCatalog(toolName, result, catalog) {
     catalog['gap_leader']     = { type: 'gap_leader',     data: companies, selectedName, title: 'Gap to Sector Leader' };
     catalog['env_scatter']    = { type: 'env_scatter',    data: companies, selectedName, title: 'Environmental vs Social Positioning' };
     catalog['pillar_stacked'] = { type: 'pillar_stacked', data: companies, selectedName, title: 'Pillar Breakdown — Top 8 Companies' };
+  }
+
+  if (toolName === 'get_recommendations' && result.recommendations) {
+    catalog['recommendations'] = {
+      type: 'recommendations',
+      data: result.recommendations,
+      currentScores: result.currentScores,
+      percentiles: result.percentiles,
+      sectorStats: result.sectorStats,
+      companyName: result.company_name,
+      title: `AI Recommendations — ${result.company_name}`,
+    };
   }
 
   if (toolName === 'get_metric_ranking' && result.ranked) {
@@ -454,6 +623,7 @@ Instructions:
    - "peer comparison" / "heatmap" → ["heatmap"]
    - "ranking for X metric" → ["percentilebar"]
    - "full analysis" / "show everything" → ["pillars", "radar", "waterfall"]
+   - "recommendations" / "action plan" / "what to improve" / "improvement plan" → call get_recommendations, then ["recommendations"]
    - "peer scores" / "score distribution" / "all companies" → call get_peer_comparison, then ["peer_bars"]
    - "gap to leader" / "how far behind best" → call get_peer_comparison, then ["gap_leader"]
    - "env vs social" / "scatter" / "positioning" → call get_peer_comparison, then ["env_scatter"]

@@ -58,3 +58,53 @@ body {
   border-radius: 12px;
   padding: 1.25rem;
 }
+
+/* Simulator range slider */
+.sim-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: #21262d;
+  outline: none;
+  cursor: pointer;
+}
+.sim-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #c9d1d9;
+  border: 2px solid #0d1117;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  cursor: grab;
+  transition: background 0.15s, transform 0.15s;
+}
+.sim-slider::-webkit-slider-thumb:hover {
+  background: #ffffff;
+  transform: scale(1.15);
+}
+.sim-slider::-webkit-slider-thumb:active {
+  cursor: grabbing;
+  background: #58a6ff;
+  transform: scale(1.2);
+}
+.sim-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #c9d1d9;
+  border: 2px solid #0d1117;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  cursor: grab;
+}
+.sim-slider::-moz-range-thumb:hover {
+  background: #ffffff;
+}
+.sim-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #21262d;
+}
