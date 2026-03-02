@@ -4,8 +4,12 @@ const api = axios.create({ baseURL: '/api' });
 
 export const getCompanies = () => api.get('/companies');
 export const getCompany = (id) => api.get(`/companies/${id}`);
-export const getBenchmarkData = (id) => api.get(`/benchmarks/company/${id}`);
+export const getBenchmarkData = (id, peerIds) => {
+  const params = peerIds?.length ? `?peerIds=${peerIds.join(',')}` : '';
+  return api.get(`/benchmarks/company/${id}${params}`);
+};
 export const getPeerComparisonData = () => api.get('/benchmarks/peer-comparison');
+export const getPeerSuggestions = (companyId) => api.get(`/companies/${companyId}/peer-suggestions`);
 
 /**
  * Send a chat message and stream SSE events back.
@@ -15,11 +19,11 @@ export const getPeerComparisonData = () => api.get('/benchmarks/peer-comparison'
  * @param {function} onEvent  — called with each parsed event object
  * @returns {Promise<void>}
  */
-export async function sendChatMessage(message, companyId, history, onEvent) {
+export async function sendChatMessage(message, companyId, history, onEvent, peerIds = null) {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, companyId, history }),
+    body: JSON.stringify({ message, companyId, history, peerIds }),
   });
 
   if (!response.ok) {

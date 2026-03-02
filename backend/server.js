@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const EsgCompany = require('./models/EsgCompany');
 const EsgReport = require('./models/EsgReport');
@@ -9,6 +10,7 @@ const {
   METRICS_CONFIG, computeDerivedMetrics, computeSectorStats,
   computePercentileRank, computeNormalizedScore, computePillarScores,
   computeGapAnalysis, computeRadarData, computeStrengthsWeaknesses,
+  selectPeerGroup, toPlain,
 } = require('./utils/benchmarkCalculations');
 
 const app = express();
@@ -18,12 +20,30 @@ connectDB();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
+// Safely cast an array of string IDs to Mongoose ObjectIds, filtering out invalid ones
+function castPeerIds(ids) {
+  if (!ids || !ids.length) return null;
+  const valid = ids.filter((id) => mongoose.isValidObjectId(id)).map((id) => new mongoose.Types.ObjectId(id));
+  return valid.length > 0 ? valid : null;
+}
+
 // ─── Helper: build full benchmark for a company ──────────────────────────────
-async function buildBenchmark(companyId) {
+async function buildBenchmark(companyId, peerIds = null) {
   const company = await EsgCompany.findById(companyId);
   if (!company) throw new Error('Company not found');
-  const allCompanies = await EsgCompany.find({});
-  const { enriched, stats } = computeSectorStats(allCompanies);
+
+  let peerCompanies;
+  const castIds = castPeerIds(peerIds);
+  if (castIds) {
+    // Use explicitly provided peer IDs
+    peerCompanies = await EsgCompany.find({ _id: { $in: castIds } });
+  } else {
+    // Auto-select peer group based on market cap
+    const allCompanies = await EsgCompany.find({});
+    peerCompanies = selectPeerGroup(allCompanies, companyId);
+  }
+
+  const { enriched, stats } = computeSectorStats(peerCompanies);
   const enrichedCompany = computeDerivedMetrics(company);
 
   const percentiles = {};
@@ -105,6 +125,13 @@ async function buildBenchmark(companyId) {
     .map((c) => ({ _id: c._id?.toString(), company_name: c.company_name, value: c.net_zero_target_year }))
     .sort((a, b) => a.value - b.value);
 
+  // Build peer group metadata for frontend
+  const peerGroup = enriched.map((c) => ({
+    _id: c._id?.toString(),
+    company_name: c.company_name,
+    market_cap_rs_cr: c.market_cap_rs_cr ?? null,
+  }));
+
   return {
     company: { ...enrichedCompany, _id: company._id?.toString() },
     pillarScores: { ...pillarScores, overall },
@@ -122,6 +149,7 @@ async function buildBenchmark(companyId) {
     boardIndComposition,
     netZeroRanked,
     peerCount: enriched.length,
+    peerGroup,
     heatmapData,
     heatmapMetrics,
   };
@@ -144,6 +172,24 @@ app.get('/api/companies/sectors', async (_, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/companies/:id/peer-suggestions', async (req, res) => {
+  try {
+    const company = await EsgCompany.findById(req.params.id);
+    if (!company) return res.status(404).json({ error: 'Not found' });
+    const allCompanies = await EsgCompany.find({});
+    const selected = selectPeerGroup(allCompanies, req.params.id);
+    const selectedIds = new Set(selected.map((c) => String(c._id)));
+    res.json({
+      selected: selected.map((c) => ({ _id: String(c._id), company_name: c.company_name, market_cap_rs_cr: c.market_cap_rs_cr ?? null })),
+      available: allCompanies
+        .map(toPlain)
+        .filter((c) => !selectedIds.has(String(c._id)))
+        .map((c) => ({ _id: String(c._id), company_name: c.company_name, market_cap_rs_cr: c.market_cap_rs_cr ?? null }))
+        .sort((a, b) => (a.company_name || '').localeCompare(b.company_name || '')),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/companies/:id', async (req, res) => {
   try {
     const company = await EsgCompany.findById(req.params.id);
@@ -154,7 +200,8 @@ app.get('/api/companies/:id', async (req, res) => {
 
 app.get('/api/benchmarks/company/:id', async (req, res) => {
   try {
-    const data = await buildBenchmark(req.params.id);
+    const rawIds = req.query.peerIds ? req.query.peerIds.split(',').filter(Boolean) : null;
+    const data = await buildBenchmark(req.params.id, rawIds);
     res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -297,7 +344,7 @@ STRICT RULES:
 ];
 
 // ─── Tool Execution ───────────────────────────────────────────────────────────
-async function executeTool(name, args) {
+async function executeTool(name, args, peerIds = null) {
   if (name === 'get_companies') {
     const companies = await EsgCompany.find({}).sort({ company_name: 1 }).select('_id company_name bse_code sector');
     const list = companies.map((c) => ({ id: c._id.toString(), name: c.company_name, bse_code: c.bse_code, sector: c.sector }));
@@ -305,7 +352,7 @@ async function executeTool(name, args) {
   }
 
   if (name === 'get_company_benchmark') {
-    const data = await buildBenchmark(args.company_id);
+    const data = await buildBenchmark(args.company_id, peerIds);
     return {
       ...data,
       summary: `Benchmark for ${data.company.company_name}: Overall ${data.pillarScores.overall}/100 (E:${data.pillarScores.environmental} S:${data.pillarScores.social} G:${data.pillarScores.governance}). ${data.strengths.length} strengths, ${data.weaknesses.length} weaknesses.`,
@@ -316,7 +363,13 @@ async function executeTool(name, args) {
     const { metric } = args;
     const config = METRICS_CONFIG[metric];
     if (!config) throw new Error(`Unknown metric: ${metric}`);
-    const companies = await EsgCompany.find({});
+    const castIds = castPeerIds(peerIds);
+    let companies;
+    if (castIds) {
+      companies = await EsgCompany.find({ _id: { $in: castIds } });
+    } else {
+      companies = await EsgCompany.find({});
+    }
     const { enriched, stats } = computeSectorStats(companies);
     const ms = stats[metric];
     const ranked = enriched
@@ -337,7 +390,13 @@ async function executeTool(name, args) {
   }
 
   if (name === 'get_sector_stats') {
-    const companies = await EsgCompany.find({});
+    const castIds = castPeerIds(peerIds);
+    let companies;
+    if (castIds) {
+      companies = await EsgCompany.find({ _id: { $in: castIds } });
+    } else {
+      companies = await EsgCompany.find({});
+    }
     const { stats } = computeSectorStats(companies);
     return { stats, summary: `Sector stats loaded for ${Object.keys(stats).length} metrics.` };
   }
@@ -371,7 +430,7 @@ async function executeTool(name, args) {
   }
 
   if (name === 'get_recommendations') {
-    const data = await buildBenchmark(args.company_id);
+    const data = await buildBenchmark(args.company_id, peerIds);
     const { weaknesses, opportunities, strengths, gapAnalysis, percentiles,
             pillarScores, sectorStats, company, peerCount } = data;
 
@@ -381,8 +440,14 @@ async function executeTool(name, args) {
     const filteredOpportunities = opportunities.filter((o) => !excludeMetrics.includes(o.metric));
 
     // Build rich per-metric context with company value, leader, avg, rank, peers
-    const allCompanies = await EsgCompany.find({});
-    const { enriched } = computeSectorStats(allCompanies);
+    const castIds = castPeerIds(peerIds);
+    let recCompanies;
+    if (castIds) {
+      recCompanies = await EsgCompany.find({ _id: { $in: castIds } });
+    } else {
+      recCompanies = await EsgCompany.find({});
+    }
+    const { enriched } = computeSectorStats(recCompanies);
     const metricDetails = {};
     Object.entries(METRICS_CONFIG).forEach(([metric, config]) => {
       if (excludeMetrics.includes(metric)) return;
@@ -585,7 +650,7 @@ function buildChartCatalog(toolName, result, catalog) {
 
 // ─── Chat endpoint (SSE streaming) ───────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
-  const { message, companyId, history = [] } = req.body;
+  const { message, companyId, history = [], peerIds = null } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -694,14 +759,25 @@ Instructions:
         send({ type: 'tool_call', tool: name, input: args, callId });
 
         try {
-          const toolResult = await executeTool(name, args);
+          const toolResult = await executeTool(name, args, peerIds);
           send({ type: 'tool_result', tool: name, callId, summary: toolResult.summary || 'Done' });
           buildChartCatalog(name, toolResult, chartCatalog);
+
+          // Strip chart-only / heavy fields before sending to Gemini —
+          // keeping them in toolResult for buildChartCatalog above is fine,
+          // but sending large blobs (radarData, heatmapData, peerGroup, etc.)
+          // to Gemini inflates the context and can disrupt suggest_charts.
+          const {
+            radarData: _r, heatmapData: _h, boxplotData: _b,
+            genderComposition: _gc, boardComposition: _bc, boardIndComposition: _bi,
+            netZeroRanked: _nz, peerGroup: _pg, normalizedScores: _ns,
+            ...geminiPayload
+          } = toolResult;
 
           functionResponses.push({
             functionResponse: {
               name,
-              response: { content: JSON.stringify(toolResult) },
+              response: { content: JSON.stringify(geminiPayload) },
             },
           });
         } catch (err) {

@@ -23,6 +23,7 @@ const esgCompanySchema = new mongoose.Schema(
     employee_turnover_rate: Number,
     independent_directors_percent: Number,
     data_breaches: Number,
+    market_cap_rs_cr: Number,
   },
   { collection: 'oil_gas_esg', strict: false }
 );

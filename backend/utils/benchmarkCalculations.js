@@ -160,9 +160,57 @@ function computeStrengthsWeaknesses(percentiles) {
   };
 }
 
+/**
+ * Select ~targetSize peers based on market_cap_rs_cr.
+ * Picks top leaders, bottom performers, and companies nearest to the selected company.
+ * @param {Array} companies - All candidate companies (Mongoose docs or plain objects)
+ * @param {string} selectedId - _id of the selected company
+ * @param {number} targetSize - Target peer group size (default 10)
+ * @returns {Array} Plain objects for the selected peers
+ */
+function selectPeerGroup(companies, selectedId, targetSize = 10) {
+  const all = companies.map(toPlain);
+  const selected = all.find((c) => String(c._id) === String(selectedId));
+  if (!selected) return all;
+
+  const others = all.filter((c) => String(c._id) !== String(selectedId));
+  if (others.length + 1 <= targetSize) return all;
+
+  const withCap = others
+    .filter((c) => c.market_cap_rs_cr != null && !isNaN(c.market_cap_rs_cr))
+    .sort((a, b) => b.market_cap_rs_cr - a.market_cap_rs_cr);
+  const withoutCap = others.filter((c) => c.market_cap_rs_cr == null || isNaN(c.market_cap_rs_cr));
+
+  const pickedIds = new Set([String(selected._id)]);
+  const pick = (arr) =>
+    arr.filter((c) => {
+      if (pickedIds.has(String(c._id))) return false;
+      pickedIds.add(String(c._id));
+      return true;
+    });
+
+  const leaders = pick(withCap.slice(0, 3));
+  const bottom = pick(withCap.slice(-2));
+
+  const selectedCap = selected.market_cap_rs_cr ?? 0;
+  const remaining = withCap
+    .filter((c) => !pickedIds.has(String(c._id)))
+    .sort((a, b) => Math.abs(a.market_cap_rs_cr - selectedCap) - Math.abs(b.market_cap_rs_cr - selectedCap));
+  const slotsLeft = targetSize - 1 - leaders.length - bottom.length;
+  const nearest = pick(remaining.slice(0, Math.max(0, slotsLeft)));
+
+  const result = [selected, ...leaders, ...bottom, ...nearest];
+
+  if (result.length < targetSize) {
+    result.push(...pick(withoutCap.slice(0, targetSize - result.length)));
+  }
+
+  return result;
+}
+
 module.exports = {
   METRICS_CONFIG, RADAR_METRICS, toPlain,
   computeDerivedMetrics, computeSectorStats, computePercentileRank,
   computeNormalizedScore, computePillarScores, computeGapAnalysis,
-  computeRadarData, computeStrengthsWeaknesses,
+  computeRadarData, computeStrengthsWeaknesses, selectPeerGroup,
 };

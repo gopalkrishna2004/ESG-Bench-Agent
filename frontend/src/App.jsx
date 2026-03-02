@@ -4,6 +4,7 @@ import Header from './components/Header';
 import MessageList from './components/MessageList';
 import ChatInput from './components/ChatInput';
 import ReportPage from './pages/ReportPage';
+import PeerGroupPanel from './components/PeerGroupPanel';
 
 const SUGGESTED_QUESTIONS = [
   'Give me a full analysis report',
@@ -21,6 +22,11 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const abortRef = useRef(null);
 
+  // Peer group state
+  const [peerGroup, setPeerGroup] = useState(null);
+  const [peerIds, setPeerIds] = useState(null);
+  const [showPeerPanel, setShowPeerPanel] = useState(false);
+
   // Report state
   const [showReport, setShowReport] = useState(false);
   const [reportData, setReportData] = useState(null);
@@ -33,7 +39,7 @@ export default function App() {
     setReportError(null);
     try {
       const [benchRes, peerRes] = await Promise.all([
-        getBenchmarkData(selectedCompany._id),
+        getBenchmarkData(selectedCompany._id, peerIds),
         getPeerComparisonData(),
       ]);
       setReportData({ benchmarkData: benchRes.data, peerData: peerRes.data });
@@ -43,13 +49,20 @@ export default function App() {
     } finally {
       setReportLoading(false);
     }
-  }, [selectedCompany]);
+  }, [selectedCompany, peerIds]);
 
   useEffect(() => {
     getCompanies()
       .then((res) => setCompanies(res.data))
       .catch(console.error);
   }, []);
+
+  // Reset peer group when company changes
+  useEffect(() => {
+    setPeerGroup(null);
+    setPeerIds(null);
+    setShowPeerPanel(false);
+  }, [selectedCompany]);
 
   // Auto-open report when Gemini returns a 'report' chart type via chat
   useEffect(() => {
@@ -112,7 +125,7 @@ export default function App() {
             updated[idx] = msg;
             return updated;
           });
-        });
+        }, peerIds);
       } catch (err) {
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.id === agentMsgId);
@@ -125,7 +138,7 @@ export default function App() {
         setIsStreaming(false);
       }
     },
-    [isStreaming, messages, selectedCompany]
+    [isStreaming, messages, selectedCompany, peerIds]
   );
 
   const clearChat = () => {
@@ -149,6 +162,8 @@ export default function App() {
         onClearChat={clearChat}
         onGenerateReport={handleGenerateReport}
         reportLoading={reportLoading}
+        onTogglePeerPanel={() => setShowPeerPanel((v) => !v)}
+        peerCount={peerIds?.length}
       />
       {reportError && (
         <div className="no-print px-4 py-2 bg-red-900/30 border-b border-red-700 text-xs text-red-400">
@@ -196,6 +211,17 @@ export default function App() {
           selectedCompany={selectedCompany}
         />
       </div>
+
+      {showPeerPanel && selectedCompany && (
+        <PeerGroupPanel
+          selectedCompany={selectedCompany}
+          peerGroup={peerGroup}
+          setPeerGroup={setPeerGroup}
+          peerIds={peerIds}
+          setPeerIds={setPeerIds}
+          onClose={() => setShowPeerPanel(false)}
+        />
+      )}
     </div>
   );
 }
